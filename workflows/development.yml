@@ -1,0 +1,137 @@
+# Contiuous Integration (CI) for regular development
+# - check formatting of changes
+# - check TypeScript
+# - run unit test
+# - run static site export
+#
+# Set `upload-artifact` to save the result of the static site export as `artifact-id` (default is 'site')
+
+name: Development
+
+on:
+  pull_request:
+
+  workflow_call:
+    inputs:
+      upload-artifact:
+        required: false
+        type: boolean
+        default: false
+      artifact-id:
+        required: false
+        type: string
+        default: 'site-export'
+
+    outputs:
+      artifact-id:
+        value: '${{ jobs.build.outputs.artifact-id }}'
+
+jobs:
+  lint:
+    name: Code style
+    runs-on: ubuntu-latest
+
+    if: github.event.pull_request != null
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch merge base
+        run: git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "current"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check format
+        run: >
+          git diff -z --diff-filter=dxub --name-only "${{ github.event.pull_request.base.sha }}..HEAD" | xargs -0 npx prettier -uc
+          || ( echo "Please run \`npm run format\` to fix." >&2; exit 1)
+
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "current"
+          cache: "npm"
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check TypeScript
+        run: npx tsc --noEmit --incremental -p .
+
+      - name: Run tests (JavaScript)
+        run: npm run test:js
+
+      - name: Run tests (Python)
+        run: npm run test:py
+
+  build:
+    name: Static site export
+    runs-on: ubuntu-latest
+
+    needs: [lint, test]
+    if: ${{ !cancelled() && needs.lint.result != 'failure' && needs.test.result == 'success' }}
+    outputs:
+      artifact-id: '${{ steps.archive.outputs.artifact-id }}'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "current"
+          cache: "npm"
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: ".next/cache"
+          # Generate a new cache whenever packages or source files change.
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json') }}-${{ hashFiles('**.[jt]s', '**.[jt]sx') }}
+          # If source files changed but packages didn't, rebuild from a prior cache.
+          restore-keys: ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json') }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Static HTML export with next.js
+        run: npm run export
+
+      - name: Archive generated site
+        id: archive
+        if: inputs.upload-artifact
+        run: |
+          find "_site/" -mindepth 1 -prune -printf "%P\n" | tar -cvf "${{ inputs.artifact-id }}.tar" -C "_site/" -T -
+          ls -hl "${{ inputs.artifact-id }}.tar"
+          echo "artifact-id=${{ inputs.artifact-id }}.tar" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive
+        if: inputs.upload-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-id }}
+          path: ${{ inputs.artifact-id }}.tar
+          if-no-files-found: error
+          retention-days: 7
