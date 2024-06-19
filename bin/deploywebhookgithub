@@ -1,0 +1,395 @@
+#!/usr/bin/python3
+"""Webhook handler for deployment events from github."""
+
+# https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks
+
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#push
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#deployment
+# https://docs.github.com/en/webhooks/webhook-events-and-payloads#deployment_status
+
+import hashlib, hmac  # noqa: E401
+import json, re  # noqa: E401
+import os, sys  # noqa: E401
+import subprocess as sp
+import traceback as tb
+from string import hexdigits
+
+from jsonschema import ValidationError, validate
+
+
+config_file = "../config.json"
+
+environment_schema = {
+    "type": "object",
+    "properties": {
+        "deploy_url": {"type": "string"},
+        "html_symlink": {"type": "string"},
+    },
+    "required": ["deploy_url", "html_symlink"]
+}
+repository_schema = {
+    "type": "object",
+    "properties": {
+        "signature_key": {"type": "string"},
+        "access_token": {"type": "string"},
+        "environments": {
+            "type": "object",
+            "patternProperties": {".*": environment_schema},
+        },
+    },
+    "required": ["signature_key", "access_token", "environments"]
+}
+config_schema = {
+    "type": "object",
+    "properties": {
+        "deploy_user": {"type": "string"},
+        "log_recipients": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "repositories": {
+            "type": "object",
+            "patternProperties": {".*": repository_schema},
+        },
+    },
+    "required": ["deploy_user", "repositories"]
+}
+
+payload_schema = {
+    "type": "object",
+    "properties": {
+        "artifact": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "url": {"type": "string"},
+                "checksum": {"type": "string", "length": 71},
+            },
+            "required": ["name", "url", "checksum"],
+        },
+        "pusher": {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string"},
+                "name": {"type": "string"},
+            },
+            "required": ["email"],
+        },
+        "authors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string"},
+                    "name": {"type": "string"},
+                    "username": {"type": "string"},
+                },
+                "required": ["email"],
+            },
+        },
+    },
+    "required": ["artifact"],
+}
+
+
+class HttpError(Exception):
+    """Exception to return HTTP error codes."""
+
+    def __init__(self, code, message=None):  # noqa: D107
+        super().__init__(self, code, message)
+        if code == 400:
+            self.status = "400 Bad Request"
+        elif code == 403:
+            self.status = "403 Forbidden"
+        elif code == 405:
+            self.status = "405 Method Not Allowed"
+            self.headers = {"Allow": "POST"}
+        elif code == 415:
+            self.status = "415 Unsupported Media Type"
+        elif code == 500:
+            self.status = "500 Internal Server Error"
+        elif code == 200:
+            self.status = "200 OK"
+        else:
+            self.status = str(code)
+
+        self.message = message
+
+
+def printLog(*args, **kwargs):
+    """Print log-message to stderr."""
+    print(*args, **kwargs, file=sys.stderr)
+
+
+def printHTTP(status, body=None, headers={}):
+    """Print plain HTTP response with `status`."""
+    print("Status:", status)
+
+    for header, value in headers.items():
+        print(f"{header}: {value}")
+    print("Content-Type: text/plain\n")
+
+    if body:
+        print(body)
+
+
+def load_config(config_file):
+    """Load and verify configuration file `config_file`."""
+    config = {}
+
+    with open(config_file, "r") as f:
+        config = json.load(f)
+
+    try:
+        validate(config, schema=config_schema)
+    except ValidationError as err:
+        tb.print_exc(file=sys.stderr)
+        raise HttpError(500, "Configuration is invalid") from err
+
+    return config
+
+
+def get_value(data, path, default=None):
+    """Get value at period-separated `path` in `data`, or `default`."""
+    try:
+        value = data
+        for key in path.split("."):
+            value = value[key]
+        return value
+    except (TypeError, KeyError):
+        return default
+
+
+def get_header(name):
+    """Get value of HTTP header `name` from the cgi environment."""
+    var = f"HTTP_{name}"
+    return os.environ.get(var, "")
+
+
+def get_body():
+    """Read request body.
+
+    Raise 415 if content-type is not JSON.
+    """
+    # only support json-encoded body
+    contentType = os.environ.get("CONTENT_TYPE")
+    if contentType != "application/json":
+        raise HttpError(415, f"Only supports 'application/json', got '{contentType}'")
+
+    body = sys.stdin.read()
+    return body
+
+
+def parse_body(body):
+    """Parse JSON payload in `body`.
+
+    Raise 400 if decoding as JSON fails.
+    """
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        printLog(body)
+        tb.print_exc(file=sys.stderr)
+        raise HttpError(400, "JSON body is malformed")
+
+
+# https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries#python-example
+def verify_request(body, repositories):
+    """Verify that the payload was sent from GitHub by validating sha256.
+
+    Checks against all configured repositories and returns a list of
+    repositories the signature is valid for.
+    Raise 403 if signature is missing or invalid.
+    """
+    # read signature header
+    signature_header = get_header("X_HUB_SIGNATURE_256")
+    printLog("X-Hub-Signature-256:", signature_header)
+
+    # extract all possible keys we have to check
+    secrets = [(repo, config["signature_key"])
+               for repo, config in repositories.items()]
+
+    # keep track of all valid repository secrets
+    is_valid = 0
+    valid_repositories = []
+    invalid_repositories = []
+
+    for repo, secret in secrets:
+        # generate hmac signature for repository
+        hash_obj = hmac.new(secret.encode("utf-8"),
+                            msg=body.encode("utf-8", "surrogateescape"),
+                            digestmod=hashlib.sha256)
+        expected_signature = "sha256=" + hash_obj.hexdigest()
+
+        # verify signature header matches the generated hmac
+        if hmac.compare_digest(expected_signature, signature_header):
+            is_valid += 1
+            valid_repositories.append(repo)
+        else:
+            is_valid += 0
+            invalid_repositories.append(repo)
+
+    # verify at least one secret generates the signature header
+    if is_valid == 0:
+        raise HttpError(403, "Missing or invalid signature")
+
+    return valid_repositories
+
+
+def handle_request():
+    """Handle cgi request."""
+    # only allow POST requests
+    method = os.environ.get("REQUEST_METHOD")
+    if method != "POST":
+        raise HttpError(405)
+
+    # load configuration
+    config = load_config(config_file)
+
+    # verify triggering event
+    event = get_header("X_GITHUB_EVENT")
+    printLog("X-Github-Event:", event)
+    if event == "":
+        raise HttpError(400, "Missing the 'X-Github-Event' header")
+    if event != "deployment_status":
+        raise HttpError(200, f"Ignore event '{event}'")
+
+    # verify request body signature against the configured secret
+    body = get_body()
+    valid_repositories = verify_request(body, config["repositories"])
+
+    # parse JSON payload
+    req = parse_body(body)
+    printLog(json.dumps(req))
+
+    # verify the originating repository
+    try:
+        repository_name = get_value(req, "repository.full_name")
+        assert repository_name in valid_repositories
+        repository = config["repositories"][repository_name]
+    except AssertionError:
+        raise HttpError(403, "Missing or invalid signature")
+    except KeyError:
+        raise HttpError(400, f"No configuration for repository '{repository_name}'")
+
+    # check the deployment environment
+    try:
+        deploy_environment = get_value(req, "deployment.environment")
+        environment = repository["environments"][deploy_environment]
+    except KeyError:
+        raise HttpError(400, f"No configuration for environment '{deploy_environment}' of {repository_name}")
+
+    deploy_task = get_value(req, "deployment.task")
+    if deploy_task != "deploy":
+        raise HttpError(400, f"Unsupported deployment task '{deploy_task}'")
+
+    # check existence of deployment id and corresponding commit sha
+    deployment_id = get_value(req, "deployment.id")
+    if deployment_id is None or type(deployment_id) is not int:
+        raise HttpError(400, f"Missing or malformed deployment id '{deployment_id}'")
+
+    deployment_sha = get_value(req, "deployment.sha")
+    if (
+        deployment_sha is None
+        or type(deployment_sha) is not str
+        or len(deployment_sha) != 40
+        or not all(c in hexdigits for c in deployment_sha)
+    ):
+        raise HttpError(400, f"Missing or malformed deployment sha '{deployment_sha}'")
+
+    # check the deployment status
+    deploy_status_environment = get_value(req, "deployment_status.environment")
+    if deploy_status_environment != deploy_environment:
+        raise HttpError(400, f"Deployment status environment does not match deploy environment: {deploy_status_environment} != {deploy_environment}")
+    deploy_status = get_value(req, "deployment_status.state")
+    if deploy_status != "pending":
+        raise HttpError(200, f"Ignore deployment status '{deploy_status}'")
+
+    # verify deployment payload
+    payload = get_value(req, "deployment.payload")
+
+    try:
+        validate(payload, schema=payload_schema)
+    except ValidationError as err:
+        tb.print_exc(file=sys.stderr)
+        raise HttpError(400, f"Malformed deployment payload: {err.message!s}") from err
+
+    # verify artifact
+    url_pattern = f"^https://api\\.github\\.com/repos/{re.escape(repository_name)}/releases/assets/\\d+$"
+    artifact_url = get_value(payload, "artifact.url")
+    if not artifact_url or re.fullmatch(url_pattern, artifact_url, re.I) is None:
+        raise HttpError(400, f"Unsupported artifact url '{artifact_url}'")
+
+    artifact_checksum = get_value(payload, "artifact.checksum")
+    if (
+        not artifact_checksum
+        or not artifact_checksum.startswith("sha256=")
+        or not all(c in hexdigits for c in artifact_checksum[7:])
+    ):
+        raise HttpError(400, f"Unsupported artifact checksum '{artifact_checksum}'")
+
+    # assemble log-mail recipients
+    log_recipients = config.get("log_recipients", [])
+    log_recipients.extend(repository.get("log_recipients", []))
+    log_recipients.extend(environment.get("log_recipients", []))
+
+    pusher_email = get_value(payload, "pusher.email")
+    if pusher_email:
+        log_recipients.append(pusher_email)
+    else:
+        printLog("Warning: Missing pusher/committer email address")
+
+    # build the parameters to pass onto the deploy command
+    command = [
+        "sudo", f"--user={config['deploy_user']}", "--set-home",
+        "../deploy_website",
+        environment["html_symlink"],  # taken from config
+        repository_name,              # validated against config
+        deploy_environment,           # validated against config
+        environment["deploy_url"],    # taken from config
+        str(deployment_id),           # verified to be a number
+        str(deployment_sha),          # verified to be valid commit hash
+        str(artifact_url),            # verified to be a valid asset URL
+        str(artifact_checksum),       # verified to be a valid hexdigest
+        *set(log_recipients),
+    ]
+
+    # add signature_key and access_token to environment to reduce leak surface
+    env = os.environ | {
+        "SIGNATURE_KEY": repository["signature_key"],  # taken from config
+        "GITHUB_TOKEN": repository["access_token"],    # taken from config
+    }
+
+    # XXX run deploy command in background and redirect to /dev/null,
+    #     otherwise github will wait for the completion of the command and
+    #     might run into a timeout after 10s
+    printLog(sys.argv[0], "running command:", " ".join(command))
+    proc = sp.Popen(command, shell=False, start_new_session=True, env=env,
+                    stdout=sp.DEVNULL, stdin=sp.DEVNULL)
+
+    # wait for 0.5s to catch an early failure and let the webhook fail
+    try:
+        proc.wait(0.5)
+    except sp.TimeoutExpired:
+        # deploy command is still running, return success
+        printHTTP("202 Accepted")
+        sys.stdout.flush()
+    else:
+        # deploy command finished already, check return code
+        returncode = proc.poll()
+        if returncode == 0:
+            printHTTP("200 OK")
+            sys.stdout.flush()
+        else:
+            # the deploy command failed early, likely an issue on our side,
+            # so let the webhook fail with 500 as well
+            raise sp.CalledProcessError(returncode, command)
+
+
+if __name__ == "__main__":
+    printLog(sys.argv[0])
+    try:
+        handle_request()
+    except HttpError as err:
+        printLog(err.status, err.message)
+        printHTTP(err.status, err.message, getattr(err, "headers", {}))

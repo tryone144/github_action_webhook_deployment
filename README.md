@@ -83,9 +83,9 @@ Create the configuration file for the webhook in
 ```
 
 Set permissions to allow the webserver to read the file.
-```bash
-sudo chmod 640 /etc/deploywebhookgithub.json
-sudo chown root:www-data /etc/deploywebhookgithub.json
+```console
+$ sudo chmod 640 /etc/deploywebhookgithub.json
+$ sudo chown root:www-data /etc/deploywebhookgithub.json
 ```
 
 The configuration contains two three-level keys:
@@ -131,6 +131,46 @@ The virtual host of the website example.com needs to be configured with
 ```apache
 DocumentRoot "/var/www/example.com/root"
 ```
+
+
+## Unix Configuration
+
+### Install Scripts
+
+```console
+$ sudo install --owner=root --group=root bin/deploywebhookgithub bin/deploy_website /usr/local/sbin
+```
+
+### Deployment User
+
+The deployment script `deploy_website` is run as user `deploy_website` via
+`sudo` from `deploywebhookgithub`. The user can be configured in
+`/etc/deploywebhookgithub.json` with `deploy_user`.
+
+Using a different user than the webserver user `www-data` makes the static
+website read-only for the webserver.
+
+```console
+$ sudo adduser --system --ingroup www-data --disabled-password --gecos 'User for deploying websites via github webhook' deploy_website
+```
+
+### Sudo Configuration
+
+To allow the webserver to run the `deploy_website` script as the user with the
+same name, create the file [`/etc/sudoers.d/deploy_website`](etc/sudoers.d/deploy_website)
+with the following content:
+
+```sudo
+Cmnd_Alias DEPLOYCMD = \
+        /usr/local/sbin/deploy_website /var/www/example.com/root githubuser/repository production *
+Defaults!DEPLOYCMD env_keep+="GITHUB_TOKEN SIGNATURE_KEY"
+%www-data       ALL=(deploy_website)NOPASSWD: DEPLOYCMD
+```
+
+The paths of the HTML root, repository name and environment must match the
+webhook configuration in `/etc/deploywebhookgithub.json`. Multiple
+paths/repositories/environments can be configured as required. The wildcard at
+the end of the command is required for passing the email addresses.
 
 
 ## GitHub Configuration

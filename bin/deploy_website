@@ -1,0 +1,343 @@
+#!/usr/bin/python3
+"""Deploy a remote release assets into a local folder.
+
+usage: $0 HTML_ROOT REPOSITORY ENVIRONMENT DEPLOYMENT_URL
+          DEPLOYMENT_ID DEPLOYMENT_SHA ARTIFACT_URL ARTIFACT_CHECKSUM
+          [EMAIL ...]
+
+    Expects the following configuration be available in environment vars:
+        - GITHUB_TOKEN: an access token for the github api
+        - SECRET_KEY: the secret for the signature/checksum verification
+
+    1. Set deployment status to "in_progress" on GitHub
+    2. Download ARTIFACT_URL
+    3. Extract artifact into $(dirname HTML_LINK)/
+    4. Remove artifact download
+    5. Replace symlink HTML_LINK atomically with link to extraction target
+    6. Remove old symlink target
+    7. Set deployment status to "success" on GitHub
+    8. Send logs to maintainers / pusher / commit authors
+"""
+
+import datetime as dt
+import hashlib, hmac  # noqa: E401
+import os, shutil, sys  # noqa: E401
+import subprocess as sp
+import time
+from argparse import ArgumentParser
+from contextlib import contextmanager
+from email.mime.text import MIMEText
+from smtplib import SMTP
+
+import requests
+from zc.lockfile import LockError, LockFile  # noqa: I201
+
+
+GH_API_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "Authorization": None,  # populated below
+    "X-GitHub-Api-Version": "2022-11-28"
+}
+
+"""Buffer for keeping log messages to send by mail."""
+LOG_LINES = []
+
+
+def printLog(*args, **kwargs):
+    """Print log-message to stderr and store for sending later."""
+    LOG_LINES.append(" ".join(str(a) for a in args).rstrip("\r\n"))
+    print(*args, **kwargs, file=sys.stderr)
+
+
+def send_log_mail(success, config):
+    """Send log output via email to maintainers."""
+    if not config["log_recipients"]:
+        printLog("WARN: No log recipients specified! Skip sending logs.")
+        return
+
+    message = MIMEText("\n".join(LOG_LINES), _charset="utf-8")
+    message["From"] = "Website Deployment <no-reply@cryptool.org>"
+    message["To"] = message["From"]
+
+    subject_stat = "deployed successfully" if success else "deployment failed"
+    message["Subject"] = f"[{config['repo']}] '{config['env']}' {subject_stat}"
+
+    with SMTP("localhost") as conn:
+        conn.send_message(message, to_addrs=config["log_recipients"])
+
+
+def fmt_size(num):
+    """Format `num` bytes to hyman readable string."""
+    for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+        if abs(num) < 1024.0:
+            return f"{num:#5.4g}{unit}B"
+        num /= 1024.0
+    return f"{num:.4g}YiB"
+
+
+def set_deployment_status(status, gh):
+    """Update the status of deployment `deployment_id`."""
+    payload = {
+        "state": str(status),
+        "environment_url": gh["url"],
+        "log_url": f"https://github.com/{gh['repo']}/commit/{gh['sha']}/checks",
+    }
+    r = requests.post(f"https://api.github.com/repos/{gh['repo']}/deployments/{gh['id']}/statuses",
+                      headers=GH_API_HEADERS, timeout=5, json=payload)
+    r.raise_for_status()
+
+
+def get_asset_size(asset_url):
+    """Retrieve content-length of asset at `asset_url`."""
+    headers = GH_API_HEADERS | {"Accept": "application/octet-stream"}
+    r = requests.head(asset_url, headers=headers, timeout=5,
+                      allow_redirects=True)
+    r.raise_for_status()
+
+    try:
+        size = r.headers.get("Content-Length")
+        return int(size)
+    except ValueError:
+        return 0
+
+
+@contextmanager
+def download_asset(asset_url, filename, checksum, secret):
+    """Download asset at `asset_url` and save as `filename`."""
+    printLog(" :: Dowload", asset_url, "to", filename)
+    asset_size = get_asset_size(asset_url)
+    printLog("Expected download size:", fmt_size(asset_size), "Bytes")
+    if asset_size > 2**32:
+        raise RuntimeError(f"{asset_url} is {fmt_size(asset_size)}! "
+                           f"Don't download files larger than 2GiB.")
+
+    # download `artifact_url` to temporary file
+    headers = GH_API_HEADERS | {"Accept": "application/octet-stream"}
+    r = requests.get(asset_url, headers=headers, timeout=5,
+                     allow_redirects=True, stream=True)
+    r.raise_for_status()
+
+    # generate hmac for downloaded artifact
+    hash_obj = hmac.new(secret.encode("utf-8"), digestmod=hashlib.sha256)
+
+    with open(filename, "wb") as fd:
+        for chunk in r.iter_content(chunk_size=256):
+            hash_obj.update(chunk)
+            fd.write(chunk)
+
+    # verify against the provided checksum
+    printLog("Checksum:", checksum)
+    expected_signature = "sha256=" + hash_obj.hexdigest()
+    if not hmac.compare_digest(expected_signature, checksum):
+        raise RuntimeError("Invalid signature for artifact {expected_signature}!")
+
+    try:
+        yield filename
+    finally:
+        try:
+            os.remove(filename)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def lock(lockfile, timeout=600):
+    """Acquire a lock for `lockfile`."""
+    def _get_lock():
+        is_waiting = False
+        start_time = time.monotonic()
+
+        while True:
+            try:
+                lock = LockFile(lockfile)
+                return lock
+            except LockError as err:
+                if not is_waiting:
+                    # read PID file, wait for `timeout` seconds
+                    try:
+                        with open(lockfile, "r") as pid_file:
+                            line = pid_file.readlines()
+                            pid = int(line[0])
+
+                        printLog(f"Lock is held by process {pid}, wait {timeout} seconds...")
+                        is_waiting = True
+
+                    except BaseException:  # noqa: B902
+                        printLog("Cannot read pid from", lockfile)
+                        raise err
+
+                elif timeout < (time.monotonic() - start_time):
+                    # timeout expired, fail
+                    printLog(f"Timeout on acquiring lock on {lockfile} after {timeout} seconds!")
+                    raise err
+
+                else:
+                    # wait 10 seconds before checking again
+                    time.sleep(10)
+
+    lock = None
+    try:
+        lock = _get_lock()
+        yield lock
+    finally:
+        if lock:
+            lock.close()
+
+
+def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
+    """Deploy `artifact_url` to `html_root`."""
+    # == 1. set deployment status to `queued`
+    set_deployment_status("queued", gh)
+
+    # normalize `html_root`
+    html_root = os.path.normpath(os.path.abspath(html_root))
+
+    # resolve base directory for this deployment
+    html_base = os.path.dirname(html_root)
+    if not os.path.isdir(html_base):
+        raise RuntimeError("html_base {html_base} is not a directory!")
+
+    # acquire lock for this deployment (timeout after 5 minutes)
+    with lock(f"{html_root}.lock", 300):
+        # set deployment status to `in_progress`
+        set_deployment_status("in_progress", gh)
+
+        # resolve old symlink target of `html_root`
+        if not os.path.islink(html_root):
+            if os.path.lexists(html_root):
+                raise RuntimeError(f"html_root {html_root} is not a symbolic link!")
+
+            printLog(f"WARN: html_root {html_root} does not yet exist!")
+            old_deployment_root = None
+        else:
+            old_deployment_root = os.path.realpath(html_root)
+
+        # generate "unique" name for this deployment
+        # XXX `sha` and `id` have been validated by the webhook
+        timestamp = dt.datetime.now().strftime(r"%Y%m%d%H%M%S")
+        deployment_name = f"{timestamp}_{gh['sha']}_{gh['id']}"
+
+        deployment_root = os.path.join(html_base, deployment_name)
+
+        filename = f"download_{deployment_name}.tar.zst"
+        filename = os.path.join(html_base, filename)
+
+        # == 2. Download artifact at `artifact_url`, 4. delete after extraction
+        with download_asset(artifact_url, filename, artifact_checksum, secret):
+            # verify archive contents
+            cmd = ["tar", "--zstd", "-tf", filename]
+            printLog("$", *cmd)
+            cmd = sp.run(cmd, capture_output=True, text=True)
+            if cmd.returncode != 0:
+                printLog(cmd.stderr)
+                raise RuntimeError(f"{filename} is not a valid zstd-compressed tar archive!")
+
+            files = cmd.stdout.splitlines()
+            if len(files) == 0:
+                raise RuntimeError(f"{filename} is empty! Skip deployment.")
+
+            # == 3. Extract artifact to `html_base`/`deployment_name`
+            os.mkdir(deployment_root)
+
+            # extract archive contents to `deployment_root`
+            printLog(":: Extract into", deployment_root)
+            cmd = ["tar", "--zstd", "-xvf", filename,
+                   "--skip-old-files", "--no-acls", "--no-xattrs",
+                   "-p", f"--owner={'bernd'}", f"--group={'users'}",
+                   "-C", deployment_root]
+            printLog("$", *cmd)
+            with sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True) as cmd:
+                for line in cmd.stdout:
+                    printLog(f"> {line}", end="")
+                printLog("")
+
+                cmd.wait()
+                if cmd.returncode != 0:
+                    raise RuntimeError(f"Extracting artifact {filename} failed!")
+
+        # == 5. Update webroot
+        # see https://stackoverflow.com/a/10886940
+        printLog(":: Replace", html_root, "with link to new deployment", deployment_root)
+
+        # create a temporary file (symlink to the new `deployment_root`)
+        tmp_html_root = os.path.join(html_base, f"root_{deployment_name}")
+        rel_deployment_root = os.path.relpath(deployment_root, html_base)
+        os.symlink(rel_deployment_root, tmp_html_root)
+
+        # replace `html_root` atomically with the new symlink (temp file)
+        os.replace(tmp_html_root, html_root)
+
+        # == 6. Remove `old_deployment_root` (previous symlink target)
+        if old_deployment_root is not None:
+            printLog(":: Remove previous deployment", old_deployment_root)
+            path_prefix = os.path.commonprefix([old_deployment_root, html_base])
+            if path_prefix != html_base:
+                printLog(f"WARN: Previous deployment {old_deployment_root} is "
+                         f"outside html_base {html_base}! Skip removing.")
+            else:
+                shutil.rmtree(old_deployment_root)
+
+    # == 7. set deployment status to `success`
+    set_deployment_status("success", gh)
+    printLog("==> Deployed successfully to", html_root)
+
+    # == 8. Send logs to maintainers / pusher / commit authors
+    send_log_mail(success=True, config=gh)
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("html_root", help="Webroot symlink")
+    parser.add_argument("repository", help="GitHub repository name")
+    parser.add_argument("environment", help="Deployment environment")
+    parser.add_argument("deployment_url", help="Public facing URL for this environment")
+    parser.add_argument("deployment_id", help="GitHub deployment id")
+    parser.add_argument("deployment_sha", help="Git commit SHA for this deployment")
+    parser.add_argument("artifact_url", help="URL to the compressed artifact archive")
+    parser.add_argument("artifact_checksum", help="Signature for the artifact archive")
+    parser.add_argument("email", nargs="*", help="Log-mail recipients")
+
+    # parse command line arguments
+    args = parser.parse_args()
+
+    # retrieve access_token from environment
+    try:
+        token = os.environ["GITHUB_TOKEN"]
+        GH_API_HEADERS["Authorization"] = f"Bearer {token}"
+    except KeyError:
+        print("Error: Missing 'GITHUB_TOKEN' in environment", file=sys.stderr)
+        sys.exit(1)
+
+    # retrieve signature_key from environment
+    try:
+        secret = os.environ["SIGNATURE_KEY"]
+    except KeyError:
+        print("Error: Missing 'SIGNATURE_KEY' in environment", file=sys.stderr)
+        sys.exit(1)
+
+    # run the actual deployment steps
+    try:
+        gh_config = {
+            "repo": args.repository,
+            "env": args.environment,
+            "id": args.deployment_id,
+            "sha": args.deployment_sha,
+            "url": args.deployment_url,
+            "log_recipients": args.email,
+        }
+
+        deploy(args.html_root, args.artifact_url, args.artifact_checksum,
+               secret, gh_config)
+    except BaseException as err:  # noqa: B902
+        printLog(f"ERROR: {err}")
+
+        try:
+            set_deployment_status("failure", gh_config)
+        except requests.HTTPError as e:
+            printLog("Cannot set deployment status to 'failure':", e)
+
+        # Send logs to maintainers / pusher / commit authors
+        send_log_mail(success=False, config=gh_config)
+
+        # re-raise exception
+        raise

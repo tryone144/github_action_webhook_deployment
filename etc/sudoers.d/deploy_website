@@ -1,0 +1,7 @@
+# Apache may run the following commands as user deploy_website without password (-> /usr/local/sbin/deploywebhookgithub)
+Cmnd_Alias DEPLOYCMD = \
+        /usr/local/sbin/deploy_website /var/www/example.com/root githubuser/repository production *
+
+Defaults!DEPLOYCMD env_keep+="GITHUB_TOKEN SIGNATURE_KEY"
+
+%www-data       ALL=(deploy_website)NOPASSWD: DEPLOYCMD
