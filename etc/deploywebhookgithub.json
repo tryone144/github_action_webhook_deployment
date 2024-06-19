@@ -1,0 +1,17 @@
+{
+  "deploy_user": "deploy_website",
+  "log_recipients": ["admin@example.com"],
+  "repositories": {
+    "githubuser/repository": {
+      "signature_key": "<random key created with: openssl rand -base64 32>",
+      "access_token": "<personal access token with read access to code and metadata + read/write to deployments",
+      "log_recipients": ["maintainer@example.com"],
+      "environments": {
+        "production": {
+          "deploy_url": "https://www.example.com/",
+          "html_symlink": "/var/www/example.com/root"
+        }
+      }
+    }
+  }
+}

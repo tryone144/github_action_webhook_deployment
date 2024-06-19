@@ -41,6 +41,98 @@ implemented as a Python script. It performs the following steps:
 1. Send the logs to configured maintainers and the committer
 
 
+## Webserver Configuration
+
+All configuration shown here is for Apache 2.4.
+
+### Webhook
+
+Configure the Python script implementing the webhook in a suitable virtual host
+or globally by using this sample
+[config](etc/apache2/conf-available/deploywebhookgithub.conf). We assume the
+virtual host `example.com` here.
+
+```apache
+ScriptAlias /deploy /usr/local/sbin/deploywebhookgithub
+<Location /deploy>
+    Require all granted
+</Location>
+```
+
+Create the configuration file for the webhook in
+[`/etc/deploywebhookgithub.json`](etc/deploywebhookgithub.json):
+
+```json
+{
+  "deploy_user": "deploy_website",
+  "log_recipients": ["admin@example.com"],
+  "repositories": {
+    "githubuser/repository": {
+      "signature_key": "<random key created with: openssl rand -base64 32>",
+      "access_token": "<personal access token with read access to code and metadata + read/write to deployments",
+      "log_recipients": ["maintainer@example.com"],
+      "environments": {
+        "production": {
+          "deploy_url": "https://www.example.com/",
+          "html_symlink": "/var/www/example.com/root"
+        }
+      }
+    }
+  }
+}
+```
+
+Set permissions to allow the webserver to read the file.
+```bash
+sudo chmod 640 /etc/deploywebhookgithub.json
+sudo chown root:www-data /etc/deploywebhookgithub.json
+```
+
+The configuration contains two three-level keys:
+
+1. `deploy_user`: A special user to run the `deploy_website` script via
+   `sudo`. This can be configured with more restrictive permissions.
+1. `log_recipients` (optional): A list of email addresses to receive the log
+   messages for all deployments.
+
+You can configure multiple GitHub repositories in `repositories`. The example
+above includes a single repository: `githubuser/repository`.
+
+For each repository the configuration contains four keys:
+
+1. `signature_key`: A random key used to authenticate GitHub to the webhook
+   script. The key needs to be configured in the GitHub webhook configuration,
+   as well (see [below](#github-configuration)).
+1. `access_tocken`: A personal access token to authenticate the deployment
+   script to the GitHub API. This token needs to be generated with *read
+   access* to the repositories code and metadata as well as with *read+write*
+   to the deployment (see [below](#github-configuration)).
+1. `log_recipients` (optional): A list of email addresses to receive the log
+   messages for each deployment of this repository.
+
+Each repository has a separate entry for the deployment environment. The
+example contains only one environment: `production`.
+
+For each repository and environment the configuration contains three keys:
+
+1. `deploy_url`: The public facing URL to the deployment of this environment.
+1. `html_symlink`: The symlink pointing to HTML root directory of the website.
+   The symlink needs to be configured in the web server as the document root
+   and will be replaced by `deploy_website` with a new directory containing the
+   generated static-site output.
+1. `log_recipients` (optional): A list of email addresses to receive the log
+   messages for each deployment in this specific environment.
+
+### Website
+
+The virtual host of the website example.com needs to be configured with
+`html_symlink` (see above) as document root.
+
+```apache
+DocumentRoot "/var/www/example.com/root"
+```
+
+
 ## GitHub Configuration
 
 ### Workflows
