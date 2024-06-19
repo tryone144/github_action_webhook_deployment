@@ -226,3 +226,122 @@ and `New repository secret` and enter the following parameters:
 ### Personal Access Token
 
 **TODO**
+
+
+## Security
+
+### Webserver
+
+This section analyzes the risk for the webserver.
+
+The webhook implementation increases the attack surface with it's REST endpoint
+to a limited degree.
+
+Calls to the REST endpoint are protected by a HMAC signature of the webhook
+payload. This signature does not protection against replay attacks. This could
+allow an attacker to trigger deployment of older instances.
+
+The replay risk can be further mitigated by protecting the endpoint with TLS,
+which is advisable in any case to protect the transmitted information. A
+different signature key can and should be used for each configured repository.
+
+The potentially untrusted information transmitted by the webhook is used to:
+
+1. Lookup parameters in the configuration file - **no risk**
+1. Verify the signature - **no risk**
+1. Create a deployment-specific HTML root - **low risk**, see below
+1. Download the generated assets - **low risk**, see below
+1. Determine the committer's email address - **low risk**, see below
+
+The deployment script is called with parameters looked up from the
+configuration file and the webhook payload. While the former are trusted, the
+latter are individually validated.
+
+- To generate a deployment-specific HTML root, the deployment-id and commit-sha
+  are extracted from the webhook payload. These are validated to be a number and
+  sha1 string. Under these circumstances, they can't escape the configured root-
+  directory for that deployment.
+
+- The download URL to the generated asset is verified to point to a release
+  asset in the configured repository. This URL is hardcoded in the deployment
+  metadata an cannot be changed. Furthermore, downloads are limited to 2GiB.
+
+- The asset is protected by an HMAC (with the same secret used for the webhook).
+  This is hardcoded into the deployment metadata and cannot be changed.
+
+- The residual risk of using the externally provided email address is sending
+  an email with the deployment logs to a potentially manipulated email address.
+
+Special shell-escaping of the parameters is not necessary as the deployment
+script is called directly via `execvpe`.
+
+
+The deployment script should be called with `sudo` using a non-privileged user,
+as described above. This allows the website to be deployed read-only for the
+webserver.
+
+The deployment script performs the following actions:
+
+1. Download the associated release asset - **low risk**, URL is validated and
+   downloads larger than 2GiB skipped.
+1. Create a deployment-specific HTML root - **no risk**, dynamic filename
+   components are verified to contain no special characters.
+1. Extract the downloaded asset into the new HTML root - **low risk**, the asset
+   is protected by an HMAC. To protect against directory traversals outside the
+   target directory, we rely on `tar`.
+1. Replace the symlink atomically with a link to new HTML directory - **no risk**
+1. Remove old HTML directory - **no risk**
+1. Email the Jekyll logs - **low risk**, see above
+
+In summary the download and extraction of a tar archive poses a limited risk if
+vulnerabilities are found in `tar` and the GitHub repository contains attacker
+controlled input to generate a malicious file.
+
+### Website
+
+The integrity of the website depends on the protection of the GitHub repository.
+Anybody who can push to the repository or subvert GitHub security controls can
+change the website. Special care has to be taken when changing the GitHub Action
+workflows and export scripts.
+
+In addition the integrity of the website depends on the integrity of the
+webserver.
+
+
+## Troubleshooting
+
+### GitHub Webhook
+
+In the webhook configuration on GitHub all executed webhook calls are listed
+and show the details including the server response.
+
+A 200 or 202 response code with empty body indicates that the call was accepted
+and the `deploy_website` script called. A message in the body indicates that the
+call was ignored.
+
+Response codes 40x indicate an error, e.g. a repository or environment not
+found in the webhook configuration, missing information in the webhook payload
+or an invalid `signature_key`.
+
+A response code of 500 indicates a more fundamental error that needs to be
+investigated in the webserver error logs.
+
+### Websserver Logs
+
+The webserver error logs show for each webhook call the JSON body, information
+on errors, the `deploy_website` call with its arguments and its output.
+
+### `deploy_website` Output
+
+The log output as well as errors detected by the `deploy_website` script are
+emailed to the last git committer leading to the webhook call as well as the
+recipients configured in `/etc/deploywebhookgithub.json`. For this to work a
+valid email address needs to be configured by the developer on his/her local
+machine. It can be checked and updated with the following commands:
+
+```console
+$ git config --global user.email
+$ git config --global user.email name@example.com
+```
+
+> **Note:** Using a GitHub issued no-reply address silently swallows the logs.
