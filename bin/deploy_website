@@ -243,7 +243,7 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
             printLog(":: Extract into", deployment_root)
             cmd = ["tar", "--zstd", "-xvf", filename,
                    "--skip-old-files", "--no-acls", "--no-xattrs",
-                   "-p", f"--owner={'bernd'}", f"--group={'users'}",
+                   "--no-same-permissions", "--no-same-owner",
                    "-C", deployment_root]
             printLog("$", *cmd)
             with sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True) as cmd:
