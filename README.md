@@ -40,6 +40,11 @@ implemented as a Python script. It performs the following steps:
 1. Set deployment status to `success` on GitHub
 1. Send the logs to configured maintainers and the committer
 
+Access to the GitHub API for downloading the release asset and updating the
+deployment status is handled via a GitHub App. This app manages retrieval of
+short-lived and restricted access tokens. To provide these permissions, the app
+has to be installed by the owner of the repository.
+
 
 ## Webserver Configuration
 
@@ -60,16 +65,17 @@ ScriptAlias /deploy /usr/local/sbin/deploywebhookgithub
 ```
 
 Create the configuration file for the webhook in
-[`/etc/deploywebhookgithub.json`](etc/deploywebhookgithub.json):
+[`/etc/deploywebhookgithub/config.json`](etc/deploywebhookgithub/config.json):
 
 ```json
 {
   "deploy_user": "deploy_website",
+  "client_id": "<client ID of GitHub App>",
+  "client_key": "<path to private key for GitHub App>",
   "log_recipients": ["admin@example.com"],
   "repositories": {
     "githubuser/repository": {
       "signature_key": "<random key created with: openssl rand -base64 32>",
-      "access_token": "<personal access token with read access to code and metadata + read/write to deployments",
       "log_recipients": ["maintainer@example.com"],
       "environments": {
         "production": {
@@ -84,29 +90,30 @@ Create the configuration file for the webhook in
 
 Set permissions to allow the webserver to read the file.
 ```console
-$ sudo chmod 640 /etc/deploywebhookgithub.json
-$ sudo chown root:www-data /etc/deploywebhookgithub.json
+$ sudo chmod 640 /etc/deploywebhookgithub/config.json
+$ sudo chown root:www-data /etc/deploywebhookgithub/config.json
 ```
 
-The configuration contains two three-level keys:
+The configuration contains five top-level keys:
 
 1. `deploy_user`: A special user to run the `deploy_website` script via
    `sudo`. This can be configured with more restrictive permissions.
+1. `client_id`: The client ID of the GitHub App used for authentication (see
+   [below](#github-configuration)).
+1. `client_key`: The path to an RSA private key of the GitHub App in PEM format.
+   Used for requesting an installation access token to authenticate the
+   deployment script against the GitHub API (see [below](#github-configuration)).
 1. `log_recipients` (optional): A list of email addresses to receive the log
    messages for all deployments.
 
 You can configure multiple GitHub repositories in `repositories`. The example
 above includes a single repository: `githubuser/repository`.
 
-For each repository the configuration contains four keys:
+For each repository the configuration contains three keys:
 
 1. `signature_key`: A random key used to authenticate GitHub to the webhook
    script. The key needs to be configured in the GitHub webhook configuration,
    as well (see [below](#github-configuration)).
-1. `access_tocken`: A personal access token to authenticate the deployment
-   script to the GitHub API. This token needs to be generated with *read
-   access* to the repositories code and metadata as well as with *read+write*
-   to the deployment (see [below](#github-configuration)).
 1. `log_recipients` (optional): A list of email addresses to receive the log
    messages for each deployment of this repository.
 
@@ -145,7 +152,7 @@ $ sudo install --owner=root --group=root bin/deploywebhookgithub bin/deploy_webs
 
 The deployment script `deploy_website` is run as user `deploy_website` via
 `sudo` from `deploywebhookgithub`. The user can be configured in
-`/etc/deploywebhookgithub.json` with `deploy_user`.
+`/etc/deploywebhookgithub/config.json` with `deploy_user`.
 
 Using a different user than the webserver user `www-data` makes the static
 website read-only for the webserver.
@@ -168,9 +175,10 @@ Defaults!DEPLOYCMD env_keep+="GITHUB_TOKEN SIGNATURE_KEY"
 ```
 
 The paths of the HTML root, repository name and environment must match the
-webhook configuration in `/etc/deploywebhookgithub.json`. Multiple
+webhook configuration in `/etc/deploywebhookgithub/config.json`. Multiple
 paths/repositories/environments can be configured as required. The wildcard at
-the end of the command is required for passing the email addresses.
+the end of the command is required for passing the deployment-id, asset-url
+and -checksum and email addresses.
 
 
 ## GitHub Configuration
@@ -204,7 +212,7 @@ enter the following parameters:
 `Secret:` random-value
 
 > **Note:** The secret needs to match the value configured in
-> `/etc/deploywebhookgithub.json`
+> `/etc/deploywebhookgithub/config.json`
 
 `SSL verification:` Select `Enable SSL verifcation`
 
@@ -221,11 +229,52 @@ and `New repository secret` and enter the following parameters:
 `Secret:` random-value
 
 > **Note:** The secret needs to match the value configured for the Webhook
-> and in `/etc/deploywebhookgithub.json`
+> and in `/etc/deploywebhookgithub/config.json`
 
-### Personal Access Token
+### GitHub App
 
-**TODO**
+Authenticating the deployment script against the GitHub API is done via a
+GitHub App.
+
+To register a new GitHub App for the organization, go to `Settings` in the
+organization scope and select `Developer Settings > GitHub Apps` and
+`New GitHub App` and enter the following parameters:
+
+`GitHub App name:` PROJECT Webhook Deployment
+
+`Homepage URL:` https://github.com/USER
+
+`Webhook`: De-select `Active`
+
+`Permissions > Repository permissions` Select `Read-only` for `Contents` and
+`Read and write` for `Deployments`
+
+> **Note:** The intended use for this app is download the generated artifact
+> and update the deployment status of select repositories. No further
+> permissions are required
+
+`Where can this GitHub App be installed?` Select `Only on this account` to
+keep this app private
+
+After creating the app, go to `General` and select `Generate a private key`.
+Securely store this key on the server at the configured path (see
+[above](#webserver-configuration)). For example, save it next to the
+configuration file at `/etc/deploywebhookgithub/private_key.pem`.
+
+> **Note:** Set permissions to allow the webserver to read the file:
+> ```console
+> $ sudo chmod 640 /etc/deploywebhookgithub/private_key.pem
+> $ sudo chown root:www-data /etc/deploywebhookgithub/private_key.pem
+> ```
+
+Finally, install the application for the organization by going to `Install App`
+and selecting `Install` on the target account. On the installation page, select
+`Only select repositories` and select all repositories you have configured in
+the configuration file above.
+
+> **Note:** You can re-use the same app when setting up a second instance of
+> this deployment webhook on a different endpoint. For additional security,
+> generate a second private key for that instance.
 
 
 ## Security
@@ -335,9 +384,9 @@ on errors, the `deploy_website` call with its arguments and its output.
 
 The log output as well as errors detected by the `deploy_website` script are
 emailed to the last git committer leading to the webhook call as well as the
-recipients configured in `/etc/deploywebhookgithub.json`. For this to work a
-valid email address needs to be configured by the developer on his/her local
-machine. It can be checked and updated with the following commands:
+recipients configured in `/etc/deploywebhookgithub/config.json`. For this to
+work a valid email address needs to be configured by the developer on his/her
+local machine. It can be checked and updated with the following commands:
 
 ```console
 $ git config --global user.email

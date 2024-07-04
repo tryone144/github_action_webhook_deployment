@@ -11,15 +11,24 @@ import hashlib, hmac  # noqa: E401
 import json, re  # noqa: E401
 import os, sys  # noqa: E401
 import subprocess as sp
+import time
 import traceback as tb
 from string import hexdigits
 
 from jsonschema import ValidationError, validate
+import jwt  # noqa: I201
+import requests  # noqa: I201
 
 
-config_file = "../config.json"
+"""Path to the configuration file."""
+config_file = "/etc/deploywebhookgithub/config.json"
 
-environment_schema = {
+GH_API_HEADERS = {
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"
+}
+
+ENVIRONMENT_SCHEMA = {
     "type": "object",
     "properties": {
         "deploy_url": {"type": "string"},
@@ -27,35 +36,36 @@ environment_schema = {
     },
     "required": ["deploy_url", "html_symlink"]
 }
-repository_schema = {
+REPOSITORY_SCHEMA = {
     "type": "object",
     "properties": {
         "signature_key": {"type": "string"},
-        "access_token": {"type": "string"},
         "environments": {
             "type": "object",
-            "patternProperties": {".*": environment_schema},
+            "patternProperties": {".*": ENVIRONMENT_SCHEMA},
         },
     },
-    "required": ["signature_key", "access_token", "environments"]
+    "required": ["signature_key", "environments"]
 }
-config_schema = {
+CONFIG_SCHEMA = {
     "type": "object",
     "properties": {
         "deploy_user": {"type": "string"},
+        "client_id": {"type": "string"},
+        "client_key": {"type": "string"},
         "log_recipients": {
             "type": "array",
             "items": {"type": "string"},
         },
         "repositories": {
             "type": "object",
-            "patternProperties": {".*": repository_schema},
+            "patternProperties": {".*": REPOSITORY_SCHEMA},
         },
     },
-    "required": ["deploy_user", "repositories"]
+    "required": ["deploy_user", "client_id", "client_key", "repositories"]
 }
 
-payload_schema = {
+PAYLOAD_SCHEMA = {
     "type": "object",
     "properties": {
         "artifact": {
@@ -141,7 +151,7 @@ def load_config(config_file):
         config = json.load(f)
 
     try:
-        validate(config, schema=config_schema)
+        validate(config, schema=CONFIG_SCHEMA)
     except ValidationError as err:
         tb.print_exc(file=sys.stderr)
         raise HttpError(500, "Configuration is invalid") from err
@@ -191,6 +201,45 @@ def parse_body(body):
         printLog(body)
         tb.print_exc(file=sys.stderr)
         raise HttpError(400, "JSON body is malformed")
+
+
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app#example-using-python-to-generate-a-jwt
+def generate_jwt(private_key, client_id):
+    """Generate a JSON-Web-Token for `client_id` signed with `private_key`."""
+    payload = {
+        "iat": int(time.time()) - 5,  # issued 5 seconds ago
+        "exp": int(time.time()) + 300,  # expires in 5 minutes
+        "iss": client_id,
+    }
+
+    with open(private_key, "rb") as kfile:
+        return jwt.encode(payload, kfile.read(), algorithm="RS256")
+
+
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation#using-an-installation-access-token-to-authenticate-as-an-app-installation
+def generate_access_token(repository, jwt):
+    """Retrieve an installation access token for `repository`."""
+    headers = GH_API_HEADERS | {"Authorization": f"Bearer {jwt}"}
+    r = requests.get(f"https://api.github.com/repos/{repository}/installation",
+                     headers=headers, timeout=5)
+    r.raise_for_status()
+
+    response = r.json()
+    access_tokens_url = get_value(response, "access_tokens_url")
+    if access_tokens_url is None:
+        raise HttpError(500, "Installation response is missing `access_tokens_url`")
+
+    payload = {"repositories": [repository.split("/", 1)[-1]]}
+    r = requests.post(access_tokens_url, headers=headers,
+                      timeout=5, json=payload)
+    r.raise_for_status()
+
+    response = r.json()
+    access_token = get_value(response, "token")
+    if access_token is None:
+        raise HttpError(500, "Access token response is missing `token`")
+
+    return access_token
 
 
 # https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries#python-example
@@ -309,7 +358,7 @@ def handle_request():
     payload = get_value(req, "deployment.payload")
 
     try:
-        validate(payload, schema=payload_schema)
+        validate(payload, schema=PAYLOAD_SCHEMA)
     except ValidationError as err:
         tb.print_exc(file=sys.stderr)
         raise HttpError(400, f"Malformed deployment payload: {err.message!s}") from err
@@ -339,6 +388,10 @@ def handle_request():
     else:
         printLog("Warning: Missing pusher/committer email address")
 
+    # generate an installation access token for this repository
+    jwt = generate_jwt(config["client_key"], config["client_id"])
+    installation_access_token = generate_access_token(repository_name, jwt)
+
     # build the parameters to pass onto the deploy command
     command = [
         "sudo", f"--user={config['deploy_user']}", "--set-home",
@@ -357,7 +410,7 @@ def handle_request():
     # add signature_key and access_token to environment to reduce leak surface
     env = os.environ | {
         "SIGNATURE_KEY": repository["signature_key"],  # taken from config
-        "GITHUB_TOKEN": repository["access_token"],    # taken from config
+        "GITHUB_TOKEN": installation_access_token,     # generated from GH API
     }
 
     # XXX run deploy command in background and redirect to /dev/null,
