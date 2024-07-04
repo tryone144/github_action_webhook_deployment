@@ -46,6 +46,23 @@ short-lived and restricted access tokens. To provide these permissions, the app
 has to be installed by the owner of the repository.
 
 
+## Python Dependencies
+
+The scripts have been successfully tested with Python 3.10.12, but newer
+versions should work.
+
+In addition to the standard library, the following libraries are required:
+- [`requests`](https://github.com/psf/requests) (tested with 2.25.1)
+- [`jsonschema`](https://github.com/python-jsonschema/jsonschema) (tested with 3.2.0)
+- [`pyjwt`](https://github.com/jpadilla/pyjwt) (tested with 2.3.0)
+- [`zc.lockfile`](https://github.com/zopefoundation/zc.lockfile) (tested with 2.0)
+
+On Ubuntu these can be installed by
+```console
+$ apt install python3-requests python3-jsonschema python3-jwt python3-zc.lockfile
+```
+
+
 ## Webserver Configuration
 
 All configuration shown here is for Apache 2.4.
