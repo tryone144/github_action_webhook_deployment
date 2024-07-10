@@ -206,13 +206,17 @@ Copy the [`development.yml`](./workflows/development.yml) and
 [`release.yml`](./workflows/release.yml) workflow definitions into your GitHub
 repository at `.github/workflows`.
 
-In [`development.yml`](./workflows/development.yml), adjust the branches that
-trigger a deployment and configure the environment variables `SHOULD_DEPLOY` to
-your repository name and `DEPLOY_(ENVIRONMENT|URL)` and your environment names
-and urls.
+In [`release.yml`](./workflows/release.yml), adjust the branches that trigger a
+deployment and configure the environment variables `SHOULD_DEPLOY` to your
+repository name, and `DEPLOY_(ENVIRONMENT|URL)` and your environment names and
+respective urls.
 
-> **Note:** These are specifically tailored to a Next.js project, but should be
-> easily adjusted to other `npm` compatible static-site generators.
+> **Note:** The `release` workflow is only run for the repository mentioned in
+> `SHOULD_DEPLOY`.
+
+> **Note:** These workflows are specifically tailored to a Next.js project, but
+> should be easily adjusted to other `npm` compatible static-site generators
+> with `test` and `export` scripts.
 
 ### Webhook
 
