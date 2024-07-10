@@ -7,6 +7,7 @@
 # https://docs.github.com/en/webhooks/webhook-events-and-payloads#deployment
 # https://docs.github.com/en/webhooks/webhook-events-and-payloads#deployment_status
 
+import datetime as dt
 import hashlib, hmac  # noqa: E401
 import json, re  # noqa: E401
 import os, sys  # noqa: E401
@@ -297,9 +298,9 @@ def handle_request():
 
     # verify triggering event
     event = get_header("X_GITHUB_EVENT")
-    printLog("X-Github-Event:", event)
+    printLog("X-GitHub-Event:", event)
     if event == "":
-        raise HttpError(400, "Missing the 'X-Github-Event' header")
+        raise HttpError(400, "Missing the 'X-GitHub-Event' header")
     if event != "deployment_status":
         raise HttpError(200, f"Ignore event '{event}'")
 
@@ -440,7 +441,7 @@ def handle_request():
 
 
 if __name__ == "__main__":
-    printLog(sys.argv[0])
+    printLog(sys.argv[0], dt.datetime.now())
     try:
         handle_request()
     except HttpError as err:
