@@ -447,3 +447,8 @@ if __name__ == "__main__":
     except HttpError as err:
         printLog(err.status, err.message)
         printHTTP(err.status, err.message, getattr(err, "headers", {}))
+
+        # XXX flush outstanding data on stdin we won't handle anymore, because
+        #     apache will fail the request if we don't consume the input
+        sys.stdin.flush()
+        sys.stdin.read()
