@@ -24,6 +24,9 @@ import requests  # noqa: I201
 """Path to the configuration file."""
 config_file = "/etc/deploywebhookgithub/config.json"
 
+"""Enable verbose debug logging (payload dumps etc.)."""
+DEBUG = False
+
 GH_API_HEADERS = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28"
@@ -130,6 +133,12 @@ class HttpError(Exception):
 def printLog(*args, **kwargs):
     """Print log-message to stderr."""
     print(*args, **kwargs, file=sys.stderr)
+
+
+def debugLog(*args, **kwargs):
+    """Print debug-message to stderr (only when DEBUG is enabled)."""
+    if DEBUG:
+        printLog(*args, **kwargs)
 
 
 def printHTTP(status, body=None, headers={}):
@@ -310,7 +319,7 @@ def handle_request():
 
     # parse JSON payload
     req = parse_body(body)
-    printLog(json.dumps(req))
+    debugLog(json.dumps(req))
 
     # verify the originating repository
     try:
@@ -414,12 +423,23 @@ def handle_request():
         "GITHUB_TOKEN": installation_access_token,     # generated from GH API
     }
 
-    # XXX run deploy command in background and redirect to /dev/null,
-    #     otherwise github will wait for the completion of the command and
-    #     might run into a timeout after 10s
+    # Deployment log file lives next to the html_symlink
+    # (e.g. /var/www/www.cryptool.org/deployment.log)
+    deployment_log = os.path.join(
+        os.path.dirname(environment["html_symlink"]), "deployment.log")
+
+    # Spawn deploy command in background. stderr is redirected to
+    # deployment_log: fcgiwrap waits for inherited stderr to close before
+    # completing the FastCGI response, so inheriting fcgiwrap's stderr
+    # pipe would delay the 202 past GitHub's 10s webhook timeout.
     printLog(sys.argv[0], "running command:", " ".join(command))
-    proc = sp.Popen(command, shell=False, start_new_session=True, env=env,
-                    stdout=sp.DEVNULL, stdin=sp.DEVNULL)
+
+    with open(deployment_log, "a") as deploy_logfile:
+        print(f"=== {dt.datetime.now()} deployment_id={deployment_id} "
+              f"sha={deployment_sha[:8]} ===", file=deploy_logfile)
+        proc = sp.Popen(command, shell=False, start_new_session=True, env=env,
+                        stdout=sp.DEVNULL, stderr=deploy_logfile,
+                        stdin=sp.DEVNULL)
 
     # wait for 0.5s to catch an early failure and let the webhook fail
     try:
