@@ -41,9 +41,10 @@ implemented as a Python script. It performs the following steps:
 1. Send the logs to configured maintainers and the committer
 
 Access to the GitHub API for downloading the release asset and updating the
-deployment status is handled via a GitHub App. This app manages retrieval of
-short-lived and restricted access tokens. To provide these permissions, the app
-has to be installed by the owner of the repository.
+deployment status is handled via a GitHub App. The deployment script retrieves
+a short-lived and repository-restricted installation token from this app for
+each deployment. To provide these permissions, the app has to be installed by
+the owner of the repository.
 
 
 ## Python Dependencies
@@ -65,9 +66,56 @@ $ apt install python3-requests python3-jsonschema python3-jwt python3-zc.lockfil
 
 ## Webserver Configuration
 
-All configuration shown here is for Apache 2.4.
+The webhook is implemented as a CGI script. The primary (production) setup is
+nginx with `fcgiwrap`; a legacy Apache 2.4 configuration is provided as well.
 
-### Webhook
+### Webhook (nginx)
+
+Include the vhost-agnostic sample
+[snippet](etc/nginx/snippets/deploywebhookgithub.conf) in a TLS-enabled
+server block of every site that receives deployment webhooks:
+
+```nginx
+include snippets/deploywebhookgithub.conf;
+```
+
+The snippet routes `POST /deploy` to the CGI script via fcgiwrap, rejects
+other methods, limits the request body to 1 MiB (matching the limit enforced
+by the CGI script itself) and applies a per-client rate limit. The required
+rate-limit zone is defined in the sample
+[`conf.d/deploywebhookgithub-ratelimit.conf`](etc/nginx/conf.d/deploywebhookgithub-ratelimit.conf),
+install it as:
+
+```console
+$ sudo install -o root -g root -m 644 etc/nginx/conf.d/deploywebhookgithub-ratelimit.conf /etc/nginx/conf.d/
+```
+
+Every request spawns a Python interpreter, even with an invalid signature —
+the rate limit bounds this cost, the HMAC signature itself is always verified
+by the CGI script.
+
+Restrict access to the fcgiwrap socket: by default it is readable and
+writable by the `www-data` group. Any process of a member of that group can
+execute arbitrary CGI scripts as the webserver user. Giving `deploy_website`
+its own group (see [Deployment User](#deployment-user)) already removes its
+access to the socket. As an additional safeguard against future members of
+the `www-data` group, restrict the socket to the webserver user itself with a
+systemd drop-in (e.g.
+`/etc/systemd/system/fcgiwrap.socket.d/hardening.conf`):
+
+```ini
+[Socket]
+SocketMode=0600
+```
+
+```console
+$ sudo systemctl daemon-reload
+$ sudo systemctl restart fcgiwrap.socket fcgiwrap
+$ ls -l /run/fcgiwrap.socket
+srw------- 1 www-data www-data 0 ... /run/fcgiwrap.socket
+```
+
+### Webhook (Apache 2.4, legacy)
 
 Configure the Python script implementing the webhook in a suitable virtual host
 or globally by using this sample
@@ -88,7 +136,6 @@ Create the configuration file for the webhook in
 {
   "deploy_user": "deploy_website",
   "client_id": "<client ID of GitHub App>",
-  "client_key": "<path to private key for GitHub App>",
   "log_recipients": ["admin@example.com"],
   "repositories": {
     "githubuser/repository": {
@@ -111,15 +158,29 @@ $ sudo chmod 640 /etc/deploywebhookgithub/config.json
 $ sudo chown root:www-data /etc/deploywebhookgithub/config.json
 ```
 
-The configuration contains five top-level keys:
+The webhook script appends a per-environment deployment log to
+`/var/log/deploywebhookgithub` (e.g.
+`/var/log/deploywebhookgithub/example.com.log`). Create this directory with
+write access for the webserver:
+```console
+$ sudo install -d -o www-data -g www-data -m 0750 /var/log/deploywebhookgithub
+```
+
+Rotate the log files weekly with the sample
+[logrotate](etc/logrotate.d/deploywebhookgithub) configuration (12 rotations,
+about three months of deployment history):
+```console
+$ sudo install -o root -g root -m 644 etc/logrotate.d/deploywebhookgithub /etc/logrotate.d/deploywebhookgithub
+```
+
+The configuration contains four top-level keys:
 
 1. `deploy_user`: A special user to run the `deploy_website` script via
    `sudo`. This can be configured with more restrictive permissions.
-1. `client_id`: The client ID of the GitHub App used for authentication (see
-   [below](#github-configuration)).
-1. `client_key`: The path to an RSA private key of the GitHub App in PEM format.
-   Used for requesting an installation access token to authenticate the
-   deployment script against the GitHub API (see [below](#github-configuration)).
+1. `client_id`: The client ID of the GitHub App. It is passed to the
+   `deploy_website` script, which mints a short-lived, repository-restricted
+   installation token against the GitHub API with it and the App's private key
+   (see [below](#github-configuration)).
 1. `log_recipients` (optional): A list of email addresses to receive the log
    messages for all deployments.
 
@@ -172,10 +233,33 @@ The deployment script `deploy_website` is run as user `deploy_website` via
 `/etc/deploywebhookgithub/config.json` with `deploy_user`.
 
 Using a different user than the webserver user `www-data` makes the static
-website read-only for the webserver.
+website read-only for the webserver. Give the user its own system group, so
+it cannot access resources shared with the webserver (the webhook
+configuration with its signature keys, the fcgiwrap socket, group-readable
+files of other sites):
 
 ```console
-$ sudo adduser --system --ingroup www-data --disabled-password --gecos 'User for deploying websites via github webhook' deploy_website
+$ sudo addgroup --system deploy_website
+$ sudo adduser --system --ingroup deploy_website --disabled-password --gecos 'User for deploying websites via github webhook' deploy_website
+```
+
+On an existing installation, move the user to the new group instead:
+
+```console
+$ sudo addgroup --system deploy_website
+$ sudo usermod -g deploy_website deploy_website
+```
+
+The webserver can still serve the deployed site, because the deployment
+script creates all files and directories world-readable (default umask 022).
+Keep it that way: if you tighten the umask of `deploy_website`, the deployed
+files must remain readable for the webserver.
+
+The parent directory of each `html_symlink` must be writable by `deploy_website`
+(the deployment script creates the HTML directories, the download file and a
+lock file there). It must not be writable by the webserver user:
+```console
+$ sudo install -d -o deploy_website -g deploy_website -m 0755 /var/www/example.com
 ```
 
 ### Sudo Configuration
@@ -187,7 +271,7 @@ with the following content:
 ```sudo
 Cmnd_Alias DEPLOYCMD = \
         /usr/local/sbin/deploy_website /var/www/example.com/root githubuser/repository production *
-Defaults!DEPLOYCMD env_keep+="GITHUB_TOKEN SIGNATURE_KEY"
+Defaults!DEPLOYCMD env_keep+="GH_CLIENT_ID SIGNATURE_KEY"
 %www-data       ALL=(deploy_website)NOPASSWD: DEPLOYCMD
 ```
 
@@ -217,6 +301,12 @@ respective urls.
 > **Note:** These workflows are specifically tailored to a Next.js project, but
 > should be easily adjusted to other `npm` compatible static-site generators
 > with `test` and `export` scripts.
+
+> **Note:** The workflows reference third-party actions by major-version tag
+> (e.g. `actions/github-script@v7`) to stay readable. For production use, pin
+> each of them to the full commit hash of the release you intend to use (e.g.
+> `actions/github-script@<sha>`), so a moved or hijacked tag cannot inject
+> code into the deployment pipeline and get access to the repository secrets.
 
 ### Webhook
 
@@ -278,14 +368,16 @@ organization scope and select `Developer Settings > GitHub Apps` and
 keep this app private
 
 After creating the app, go to `General` and select `Generate a private key`.
-Securely store this key on the server at the configured path (see
-[above](#webserver-configuration)). For example, save it next to the
-configuration file at `/etc/deploywebhookgithub/private_key.pem`.
+Securely store this key on the server at the fixed path
+`/etc/deploywebhookgithub/private_key.pem` next to the configuration file.
+This path is pinned in the `deploy_website` script, which mints the
+installation tokens from the key.
 
-> **Note:** Set permissions to allow the webserver to read the file:
+> **Note:** Set permissions to allow only the deployment user to read the file
+> (the webserver does not need and must not have access):
 > ```console
-> $ sudo chmod 640 /etc/deploywebhookgithub/private_key.pem
-> $ sudo chown root:www-data /etc/deploywebhookgithub/private_key.pem
+> $ sudo chown deploy_website:deploy_website /etc/deploywebhookgithub/private_key.pem
+> $ sudo chmod 400 /etc/deploywebhookgithub/private_key.pem
 > ```
 
 Finally, install the application for the organization by going to `Install App`
@@ -343,7 +435,23 @@ latter are individually validated.
   an email with the deployment logs to a potentially manipulated email address.
 
 Special shell-escaping of the parameters is not necessary as the deployment
-script is called directly via `execvpe`.
+script is called directly via `execvpe`. Since the webserver user can also call
+the deployment script directly via `sudo`, the script re-validates all of its
+arguments itself as a second line of defense.
+
+The webhook itself does not hold any GitHub credentials. It only passes the
+App's client ID to the deployment script, which mints a short-lived,
+repository-restricted installation token from it and the App's private key.
+The private key is readable only by the `deploy_user`: a compromised webserver
+can trigger deployments, but can neither read the long-lived private key nor
+the minted tokens. Conversely, the deployment user holds no webserver
+privileges: with its own group it cannot read the webserver's group
+resources — in particular the webhook configuration file, which contains the
+signature keys of *all* configured repositories. The signature key of the
+repository currently being deployed is still passed to the deployment script
+via the `SIGNATURE_KEY` environment variable (by design, see the sudo
+configuration above), so the deployment user's runtime exposure is limited to
+that single key of the repository it deploys.
 
 
 The deployment script should be called with `sudo` using a non-privileged user,
@@ -358,7 +466,9 @@ The deployment script performs the following actions:
    components are verified to contain no special characters.
 1. Extract the downloaded asset into the new HTML root - **low risk**, the asset
    is protected by an HMAC. To protect against directory traversals outside the
-   target directory, we rely on `tar`.
+    target directory, we rely on `tar`. The archive listing is checked before
+    extraction and archives containing symlinks, hardlinks or special files
+    are rejected.
 1. Replace the symlink atomically with a link to new HTML directory - **no risk**
 1. Remove old HTML directory - **no risk**
 1. Email the Jekyll logs - **low risk**, see above
@@ -400,6 +510,10 @@ investigated in the webserver error logs.
 
 The webserver error logs show for each webhook call the JSON body, information
 on errors, the `deploy_website` call with its arguments and its output.
+
+The output of the `deploy_website` script is appended to a per-environment log
+file under `/var/log/deploywebhookgithub/` (e.g.
+`/var/log/deploywebhookgithub/example.com.log`).
 
 ### `deploy_website` Output
 

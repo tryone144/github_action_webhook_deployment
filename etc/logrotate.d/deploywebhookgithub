@@ -1,0 +1,12 @@
+# Rotate the deployment logs of the webhook + deploy_website scripts.
+# Install as root to /etc/logrotate.d/deploywebhookgithub
+
+/var/log/deploywebhookgithub/*.log {
+    weekly
+    rotate 12
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 www-data www-data
+}
