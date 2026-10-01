@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Webhook handler for deployment events from github."""
 
 # https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks
@@ -12,13 +12,10 @@ import hashlib, hmac  # noqa: E401
 import json, re  # noqa: E401
 import os, sys  # noqa: E401
 import subprocess as sp
-import time
 import traceback as tb
 from string import hexdigits
 
 from jsonschema import ValidationError, validate
-import jwt  # noqa: I201
-import requests  # noqa: I201
 
 
 """Path to the configuration file."""
@@ -26,6 +23,12 @@ config_file = "/etc/deploywebhookgithub/config.json"
 
 """Enable verbose debug logging (payload dumps etc.)."""
 DEBUG = False
+
+"""Maximum size of the request body to accept (bytes)."""
+MAX_BODY_SIZE = 2**20
+
+"""Directory for the per-environment deployment log files."""
+LOG_DIR = "/var/log/deploywebhookgithub"
 
 GH_API_HEADERS = {
     "Accept": "application/vnd.github+json",
@@ -56,7 +59,6 @@ CONFIG_SCHEMA = {
     "properties": {
         "deploy_user": {"type": "string"},
         "client_id": {"type": "string"},
-        "client_key": {"type": "string"},
         "log_recipients": {
             "type": "array",
             "items": {"type": "string"},
@@ -66,7 +68,7 @@ CONFIG_SCHEMA = {
             "patternProperties": {".*": REPOSITORY_SCHEMA},
         },
     },
-    "required": ["deploy_user", "client_id", "client_key", "repositories"]
+    "required": ["deploy_user", "client_id", "repositories"]
 }
 
 PAYLOAD_SCHEMA = {
@@ -77,7 +79,7 @@ PAYLOAD_SCHEMA = {
             "properties": {
                 "name": {"type": "string"},
                 "url": {"type": "string"},
-                "checksum": {"type": "string", "length": 71},
+                "checksum": {"type": "string", "minLength": 71, "maxLength": 71},
             },
             "required": ["name", "url", "checksum"],
         },
@@ -118,6 +120,8 @@ class HttpError(Exception):
         elif code == 405:
             self.status = "405 Method Not Allowed"
             self.headers = {"Allow": "POST"}
+        elif code == 413:
+            self.status = "413 Payload Too Large"
         elif code == 415:
             self.status = "415 Unsupported Media Type"
         elif code == 500:
@@ -141,11 +145,11 @@ def debugLog(*args, **kwargs):
         printLog(*args, **kwargs)
 
 
-def printHTTP(status, body=None, headers={}):
+def printHTTP(status, body=None, headers=None):
     """Print plain HTTP response with `status`."""
     print("Status:", status)
 
-    for header, value in headers.items():
+    for header, value in (headers or {}).items():
         print(f"{header}: {value}")
     print("Content-Type: text/plain\n")
 
@@ -186,18 +190,36 @@ def get_header(name):
     return os.environ.get(var, "")
 
 
+def deployment_log_path(html_symlink):
+    """Path of the deployment log file for the environment at `html_symlink`."""
+    log_name = os.path.basename(os.path.dirname(html_symlink)) or "deploy"
+    return os.path.join(LOG_DIR, f"{log_name}.log")
+
+
 def get_body():
     """Read request body.
 
-    Raise 415 if content-type is not JSON.
+    Raise 415 if content-type is not JSON and 413 if the body is too large.
     """
     # only support json-encoded body
     contentType = os.environ.get("CONTENT_TYPE")
     if contentType != "application/json":
         raise HttpError(415, f"Only supports 'application/json', got '{contentType}'")
 
-    body = sys.stdin.read()
-    return body
+    # refuse oversized request bodies before reading them
+    try:
+        content_length = int(os.environ.get("CONTENT_LENGTH", "0"))
+    except ValueError:
+        content_length = 0
+    if content_length > MAX_BODY_SIZE:
+        raise HttpError(413, f"Request body is too large ({content_length} > {MAX_BODY_SIZE} bytes)")
+
+    if content_length > 0:
+        # apache provides exactly `content_length` bytes, followed by EOF
+        return sys.stdin.read()
+
+    # without content-length read at most `MAX_BODY_SIZE` characters
+    return sys.stdin.read(MAX_BODY_SIZE)
 
 
 def parse_body(body):
@@ -211,45 +233,6 @@ def parse_body(body):
         printLog(body)
         tb.print_exc(file=sys.stderr)
         raise HttpError(400, "JSON body is malformed")
-
-
-# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app#example-using-python-to-generate-a-jwt
-def generate_jwt(private_key, client_id):
-    """Generate a JSON-Web-Token for `client_id` signed with `private_key`."""
-    payload = {
-        "iat": int(time.time()) - 5,  # issued 5 seconds ago
-        "exp": int(time.time()) + 300,  # expires in 5 minutes
-        "iss": client_id,
-    }
-
-    with open(private_key, "rb") as kfile:
-        return jwt.encode(payload, kfile.read(), algorithm="RS256")
-
-
-# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation#using-an-installation-access-token-to-authenticate-as-an-app-installation
-def generate_access_token(repository, jwt):
-    """Retrieve an installation access token for `repository`."""
-    headers = GH_API_HEADERS | {"Authorization": f"Bearer {jwt}"}
-    r = requests.get(f"https://api.github.com/repos/{repository}/installation",
-                     headers=headers, timeout=5)
-    r.raise_for_status()
-
-    response = r.json()
-    access_tokens_url = get_value(response, "access_tokens_url")
-    if access_tokens_url is None:
-        raise HttpError(500, "Installation response is missing `access_tokens_url`")
-
-    payload = {"repositories": [repository.split("/", 1)[-1]]}
-    r = requests.post(access_tokens_url, headers=headers,
-                      timeout=5, json=payload)
-    r.raise_for_status()
-
-    response = r.json()
-    access_token = get_value(response, "token")
-    if access_token is None:
-        raise HttpError(500, "Access token response is missing `token`")
-
-    return access_token
 
 
 # https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries#python-example
@@ -268,10 +251,8 @@ def verify_request(body, repositories):
     secrets = [(repo, config["signature_key"])
                for repo, config in repositories.items()]
 
-    # keep track of all valid repository secrets
-    is_valid = 0
+    # keep track of all repositories the signature is valid for
     valid_repositories = []
-    invalid_repositories = []
 
     for repo, secret in secrets:
         # generate hmac signature for repository
@@ -280,16 +261,14 @@ def verify_request(body, repositories):
                             digestmod=hashlib.sha256)
         expected_signature = "sha256=" + hash_obj.hexdigest()
 
-        # verify signature header matches the generated hmac
-        if hmac.compare_digest(expected_signature, signature_header):
-            is_valid += 1
+        # verify signature header matches the generated hmac; compare raw
+        # bytes, so a non-ascii signature header cannot raise a TypeError
+        if hmac.compare_digest(expected_signature.encode("utf-8"),
+                               signature_header.encode("utf-8", "surrogateescape")):
             valid_repositories.append(repo)
-        else:
-            is_valid += 0
-            invalid_repositories.append(repo)
 
     # verify at least one secret generates the signature header
-    if is_valid == 0:
+    if not valid_repositories:
         raise HttpError(403, "Missing or invalid signature")
 
     return valid_repositories
@@ -382,6 +361,7 @@ def handle_request():
     artifact_checksum = get_value(payload, "artifact.checksum")
     if (
         not artifact_checksum
+        or len(artifact_checksum) != 71
         or not artifact_checksum.startswith("sha256=")
         or not all(c in hexdigits for c in artifact_checksum[7:])
     ):
@@ -398,14 +378,14 @@ def handle_request():
     else:
         printLog("Warning: Missing pusher/committer email address")
 
-    # generate an installation access token for this repository
-    jwt = generate_jwt(config["client_key"], config["client_id"])
-    installation_access_token = generate_access_token(repository_name, jwt)
+    # resolve `deploy_website` next to this script to an absolute path
+    deploy_script = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "deploy_website")
 
     # build the parameters to pass onto the deploy command
     command = [
         "sudo", f"--user={config['deploy_user']}", "--set-home",
-        "../deploy_website",
+        deploy_script,
         environment["html_symlink"],  # taken from config
         repository_name,              # validated against config
         deploy_environment,           # validated against config
@@ -417,16 +397,14 @@ def handle_request():
         *set(log_recipients),
     ]
 
-    # add signature_key and access_token to environment to reduce leak surface
+    # add signature_key and client_id to environment to reduce leak surface
     env = os.environ | {
         "SIGNATURE_KEY": repository["signature_key"],  # taken from config
-        "GITHUB_TOKEN": installation_access_token,     # generated from GH API
+        "GH_CLIENT_ID": config["client_id"],           # taken from config
     }
 
-    # Deployment log file lives next to the html_symlink
-    # (e.g. /var/www/www.cryptool.org/deployment.log)
-    deployment_log = os.path.join(
-        os.path.dirname(environment["html_symlink"]), "deployment.log")
+    # Deployment log file (e.g. /var/log/deploywebhookgithub/example.com.log)
+    deployment_log = deployment_log_path(environment["html_symlink"])
 
     # Spawn deploy command in background. stderr is redirected to
     # deployment_log: fcgiwrap waits for inherited stderr to close before
@@ -471,4 +449,5 @@ if __name__ == "__main__":
         # XXX flush outstanding data on stdin we won't handle anymore, because
         #     apache will fail the request if we don't consume the input
         sys.stdin.flush()
-        sys.stdin.read()
+        while sys.stdin.read(MAX_BODY_SIZE):
+            pass

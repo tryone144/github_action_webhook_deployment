@@ -2,6 +2,6 @@
 Cmnd_Alias DEPLOYCMD = \
         /usr/local/sbin/deploy_website /var/www/example.com/root githubuser/repository production *
 
-Defaults!DEPLOYCMD env_keep+="GITHUB_TOKEN SIGNATURE_KEY"
+Defaults!DEPLOYCMD env_keep+="GH_CLIENT_ID SIGNATURE_KEY"
 
 %www-data       ALL=(deploy_website)NOPASSWD: DEPLOYCMD

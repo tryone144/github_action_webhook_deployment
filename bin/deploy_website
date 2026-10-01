@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Deploy a remote release assets into a local folder.
 
 usage: $0 HTML_ROOT REPOSITORY ENVIRONMENT DEPLOYMENT_URL
@@ -6,8 +6,10 @@ usage: $0 HTML_ROOT REPOSITORY ENVIRONMENT DEPLOYMENT_URL
           [EMAIL ...]
 
     Expects the following configuration be available in environment vars:
-        - GITHUB_TOKEN: an access token for the github api
-        - SECRET_KEY: the secret for the signature/checksum verification
+        - GH_CLIENT_ID: the client ID of the GitHub App; a short-lived
+          installation token for the github api is minted from it and the
+          private key at CLIENT_KEY_PATH
+        - SIGNATURE_KEY: the secret for the signature/checksum verification
 
     1. Set deployment status to "in_progress" on GitHub
     2. Download ARTIFACT_URL
@@ -21,7 +23,7 @@ usage: $0 HTML_ROOT REPOSITORY ENVIRONMENT DEPLOYMENT_URL
 
 import datetime as dt
 import hashlib, hmac  # noqa: E401
-import os, shutil, sys  # noqa: E401
+import os, re, shutil, sys  # noqa: E401
 import subprocess as sp
 import time
 from argparse import ArgumentParser
@@ -29,6 +31,7 @@ from contextlib import contextmanager
 from email.mime.text import MIMEText
 from smtplib import SMTP
 
+import jwt  # noqa: I201
 import requests
 from zc.lockfile import LockError, LockFile  # noqa: I201
 
@@ -38,6 +41,12 @@ GH_API_HEADERS = {
     "Authorization": None,  # populated below
     "X-GitHub-Api-Version": "2022-11-28"
 }
+
+"""Maximum size of a release asset to download (2 GiB)."""
+MAX_ASSET_SIZE = 2**31
+
+"""Path to the private key of the GitHub App in PEM format."""
+CLIENT_KEY_PATH = "/etc/deploywebhookgithub/private_key.pem"
 
 """Buffer for keeping log messages to send by mail."""
 LOG_LINES = []
@@ -75,6 +84,80 @@ def fmt_size(num):
     return f"{num:.4g}YiB"
 
 
+def validate_args(parser, args):
+    """Validate command line arguments, exit with error on malformed input.
+
+    The webserver user can invoke this script directly via `sudo` (see
+    `etc/sudoers.d/deploy_website`), so all arguments must be validated
+    here independently of the checks in the webhook script.
+    """
+    errors = []
+
+    if not os.path.isabs(args.html_root):
+        errors.append(f"html_root '{args.html_root}' is not an absolute path")
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", args.repository) is None:
+        errors.append(f"repository '{args.repository}' is not of the form 'owner/repo'")
+    if re.search(r"[\x00-\x1f\x7f]", args.environment):
+        errors.append(f"environment '{args.environment}' contains control characters")
+    if re.fullmatch(r"https?://\S+", args.deployment_url) is None:
+        errors.append(f"deployment_url '{args.deployment_url}' is not an URL")
+    if re.fullmatch(r"\d{1,20}", args.deployment_id) is None:
+        errors.append(f"deployment_id '{args.deployment_id}' is not a number")
+    if re.fullmatch(r"[0-9a-fA-F]{40}", args.deployment_sha) is None:
+        errors.append(f"deployment_sha '{args.deployment_sha}' is not a commit sha")
+    artifact_url_pattern = (rf"https://api\.github\.com/repos/"
+                            rf"{re.escape(args.repository)}/releases/assets/\d+")
+    if re.fullmatch(artifact_url_pattern, args.artifact_url, re.I) is None:
+        errors.append(f"artifact_url '{args.artifact_url}' is not a release asset of '{args.repository}'")
+    if re.fullmatch(r"sha256=[0-9a-fA-F]{64}", args.artifact_checksum) is None:
+        errors.append(f"artifact_checksum '{args.artifact_checksum}' is not a sha256 digest")
+    for email in args.email:
+        if re.fullmatch(r"[^@\s]+@[^@\s]+", email) is None:
+            errors.append(f"email '{email}' is malformed")
+
+    if errors:
+        parser.error("\n  " + "\n  ".join(errors))
+
+
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app#example-using-python-to-generate-a-jwt
+def generate_jwt(private_key, client_id):
+    """Generate a JSON-Web-Token for `client_id` signed with `private_key`."""
+    payload = {
+        "iat": int(time.time()) - 5,  # issued 5 seconds ago
+        "exp": int(time.time()) + 300,  # expires in 5 minutes
+        "iss": client_id,
+    }
+
+    with open(private_key, "rb") as kfile:
+        return jwt.encode(payload, kfile.read(), algorithm="RS256")
+
+
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation#using-an-installation-access-token-to-authenticate-as-an-app-installation
+def generate_access_token(repository, jwt_token):
+    """Retrieve an installation access token restricted to `repository`."""
+    headers = GH_API_HEADERS | {"Authorization": f"Bearer {jwt_token}"}
+    r = requests.get(f"https://api.github.com/repos/{repository}/installation",
+                     headers=headers, timeout=5)
+    r.raise_for_status()
+
+    response = r.json()
+    access_tokens_url = response.get("access_tokens_url")
+    if access_tokens_url is None:
+        raise RuntimeError("Installation response is missing `access_tokens_url`")
+
+    payload = {"repositories": [repository.split("/", 1)[-1]]}
+    r = requests.post(access_tokens_url, headers=headers,
+                      timeout=5, json=payload)
+    r.raise_for_status()
+
+    response = r.json()
+    access_token = response.get("token")
+    if access_token is None:
+        raise RuntimeError("Access token response is missing `token`")
+
+    return access_token
+
+
 def set_deployment_status(status, gh):
     """Update the status of deployment `deployment_id`."""
     payload = {
@@ -107,7 +190,7 @@ def download_asset(asset_url, filename, checksum, secret):
     printLog(" :: Dowload", asset_url, "to", filename)
     asset_size = get_asset_size(asset_url)
     printLog("Expected download size:", fmt_size(asset_size), "Bytes")
-    if asset_size > 2**32:
+    if asset_size > MAX_ASSET_SIZE:
         raise RuntimeError(f"{asset_url} is {fmt_size(asset_size)}! "
                            f"Don't download files larger than 2GiB.")
 
@@ -120,8 +203,15 @@ def download_asset(asset_url, filename, checksum, secret):
     # generate hmac for downloaded artifact
     hash_obj = hmac.new(secret.encode("utf-8"), digestmod=hashlib.sha256)
 
-    with open(filename, "wb") as fd:
+    downloaded_size = 0
+    # create the download file exclusively: never follow a pre-placed
+    # symlink at the predictable download path
+    download_fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(download_fd, "wb") as fd:
         for chunk in r.iter_content(chunk_size=256):
+            downloaded_size += len(chunk)
+            if downloaded_size > MAX_ASSET_SIZE:
+                raise RuntimeError(f"Download of {asset_url} exceeds 2GiB, aborted!")
             hash_obj.update(chunk)
             fd.write(chunk)
 
@@ -129,7 +219,8 @@ def download_asset(asset_url, filename, checksum, secret):
     printLog("Checksum:", checksum)
     expected_signature = "sha256=" + hash_obj.hexdigest()
     if not hmac.compare_digest(expected_signature, checksum):
-        raise RuntimeError("Invalid signature for artifact {expected_signature}!")
+        raise RuntimeError(f"Invalid signature for artifact {filename}: "
+                           f"expected {expected_signature}, got {checksum}!")
 
     try:
         yield filename
@@ -195,10 +286,13 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
     # resolve base directory for this deployment
     html_base = os.path.dirname(html_root)
     if not os.path.isdir(html_base):
-        raise RuntimeError("html_base {html_base} is not a directory!")
+        raise RuntimeError(f"html_base {html_base} is not a directory!")
 
     # acquire lock for this deployment (timeout after 5 minutes)
-    with lock(f"{html_root}.lock", 300):
+    lockfile = f"{html_root}.lock"
+    if os.path.islink(lockfile):
+        raise RuntimeError(f"Refusing lockfile {lockfile}, it is a symbolic link!")
+    with lock(lockfile, 300):
         # set deployment status to `in_progress`
         set_deployment_status("in_progress", gh)
 
@@ -213,7 +307,7 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
             old_deployment_root = os.path.realpath(html_root)
 
         # generate "unique" name for this deployment
-        # XXX `sha` and `id` have been validated by the webhook
+        # `sha` and `id` have been validated by `validate_args`
         timestamp = dt.datetime.now().strftime(r"%Y%m%d%H%M%S")
         deployment_name = f"{timestamp}_{gh['sha']}_{gh['id']}"
 
@@ -225,7 +319,7 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
         # == 2. Download artifact at `artifact_url`, 4. delete after extraction
         with download_asset(artifact_url, filename, artifact_checksum, secret):
             # verify archive contents
-            cmd = ["tar", "--zstd", "-tf", filename]
+            cmd = ["tar", "--zstd", "-tvf", filename]
             printLog("$", *cmd)
             cmd = sp.run(cmd, capture_output=True, text=True)
             if cmd.returncode != 0:
@@ -235,6 +329,13 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
             files = cmd.stdout.splitlines()
             if len(files) == 0:
                 raise RuntimeError(f"{filename} is empty! Skip deployment.")
+
+            # only allow plain files and directories: reject symlinks,
+            # hardlinks and special files
+            unsafe_members = [f for f in files if f and f[0] not in "-d"]
+            if unsafe_members:
+                printLog("Unsafe archive members:", *unsafe_members)
+                raise RuntimeError(f"{filename} contains symlinks or special files!")
 
             # == 3. Extract artifact to `html_base`/`deployment_name`
             os.mkdir(deployment_root)
@@ -270,10 +371,20 @@ def deploy(html_root, artifact_url, artifact_checksum, secret, gh):
         # == 6. Remove `old_deployment_root` (previous symlink target)
         if old_deployment_root is not None:
             printLog(":: Remove previous deployment", old_deployment_root)
-            path_prefix = os.path.commonprefix([old_deployment_root, html_base])
-            if path_prefix != html_base:
+            # only remove deployments that live inside `html_base`, compare
+            # path components instead of string prefixes
+            html_base_real = os.path.realpath(html_base)
+            try:
+                inside_base = (
+                    old_deployment_root != html_base_real
+                    and os.path.commonpath(
+                        [old_deployment_root, html_base_real]) == html_base_real
+                )
+            except ValueError:
+                inside_base = False
+            if not inside_base:
                 printLog(f"WARN: Previous deployment {old_deployment_root} is "
-                         f"outside html_base {html_base}! Skip removing.")
+                         f"outside html_base {html_base_real}! Skip removing.")
             else:
                 shutil.rmtree(old_deployment_root)
 
@@ -300,13 +411,26 @@ if __name__ == "__main__":
     # parse command line arguments
     args = parser.parse_args()
 
-    # retrieve access_token from environment
+    # validate arguments, they may also come directly from the webserver user
+    validate_args(parser, args)
+
+    # retrieve the GitHub App client id and mint a fresh, repository-
+    # restricted installation token from it and the pinned private key
     try:
-        token = os.environ["GITHUB_TOKEN"]
-        GH_API_HEADERS["Authorization"] = f"Bearer {token}"
+        client_id = os.environ["GH_CLIENT_ID"]
     except KeyError:
-        print("Error: Missing 'GITHUB_TOKEN' in environment", file=sys.stderr)
+        print("Error: Missing 'GH_CLIENT_ID' in environment", file=sys.stderr)
         sys.exit(1)
+
+    try:
+        installation_jwt = generate_jwt(CLIENT_KEY_PATH, client_id)
+        token = generate_access_token(args.repository, installation_jwt)
+    except (OSError, RuntimeError, jwt.PyJWTError,
+            requests.RequestException) as err:
+        print(f"Error: Cannot obtain installation token for "
+              f"'{args.repository}': {err}", file=sys.stderr)
+        sys.exit(1)
+    GH_API_HEADERS["Authorization"] = f"Bearer {token}"
 
     # retrieve signature_key from environment
     try:

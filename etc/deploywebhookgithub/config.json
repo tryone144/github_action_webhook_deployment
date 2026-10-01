@@ -1,7 +1,6 @@
 {
   "deploy_user": "deploy_website",
   "client_id": "<client ID of GitHub App>",
-  "client_key": "<path to private key for GitHub App>",
   "log_recipients": ["admin@example.com"],
   "repositories": {
     "githubuser/repository": {
