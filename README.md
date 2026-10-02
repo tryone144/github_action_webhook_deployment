@@ -380,6 +380,15 @@ installation tokens from the key.
 > $ sudo chmod 400 /etc/deploywebhookgithub/private_key.pem
 > ```
 
+> **Note:** The deployment user is not a member of the `www-data` group, so it
+> cannot traverse the configuration directory owned by that group by default —
+> reading the private key requires execute permission on every path component.
+> Grant directory traversal; the files inside stay protected by their own
+> permissions:
+> ```console
+> $ sudo chmod o+x /etc/deploywebhookgithub
+> ```
+
 Finally, install the application for the organization by going to `Install App`
 and selecting `Install` on the target account. On the installation page, select
 `Only select repositories` and select all repositories you have configured in
